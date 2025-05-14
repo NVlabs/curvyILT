@@ -2,7 +2,7 @@
 #NVIDIA  All Rights Reserved
 #Haoyu Yang 
 #Design Automation Research
-#Last Update: May 13 2025
+#Last Update: May 14 2025
 #############################
 
 import torch
@@ -147,11 +147,11 @@ class litho(nn.Module):
         mask[self.mask.data>=0.5]=1.0
         mask[self.mask.data<0.5]=0.0
         if self.morph>0 and use_morph:
-            mask_o = opening(mask, self.morph_kernel_opening, engine="convolution")
-            mask_c = closing(mask, self.morph_kernel_closing, engine="convolution")
+            mask_o = opening(mask, self.morph_kernel_opening, engine="unfold")
+            mask_c = closing(mask, self.morph_kernel_closing, engine="unfold")
             mask = mask_o+mask_c-mask
-            mask = opening(mask, self.morph_kernel_opening, engine="convolution")
-            mask = closing(mask, self.morph_kernel_closing, engine="convolution")
+            mask = opening(mask, self.morph_kernel_opening, engine="unfold")
+            mask = closing(mask, self.morph_kernel_closing, engine="unfold")
 
         mask_fft = torch.fft.fftshift(torch.fft.fft2(mask)) 
         mask_fft = torch.repeat_interleave(mask_fft, self.kernel_num, 1) 

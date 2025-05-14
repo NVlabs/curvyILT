@@ -2,7 +2,7 @@
 #NVIDIA  All Rights Reserved
 #Haoyu Yang 
 #Design Automation Research
-#Last Update: Aug 25 2024
+#Last Update: May 14 2025
 #############################
 import curvyilt
 import cv2
@@ -46,11 +46,8 @@ if __name__=="__main__":
    
 
         with torch.no_grad():
-            if False:
-                solver.litho.mask_s.data=solver.litho.standalone_mask_morph()
-                solver.litho.mask.data = nn.functional.interpolate(input=solver.litho.avepool(solver.litho.mask_s).data, scale_factor=solver.litho.scale_factor, mode = 'bicubic', align_corners=False, antialias=True)
-            else:
-                solver.litho.mask.data = nn.functional.interpolate(input=solver.litho.avepool(solver.litho.mask_s).data, scale_factor=solver.litho.scale_factor, mode = 'bicubic', align_corners=False, antialias=True)
+
+            solver.litho.mask.data = nn.functional.interpolate(input=solver.litho.avepool(solver.litho.mask_s).data, scale_factor=solver.litho.scale_factor, mode = 'bicubic', align_corners=False, antialias=True)
 
             mask, cmask, x_out, x_out_max, x_out_min = solver.litho.forward_test(use_morph=True)
             
