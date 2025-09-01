@@ -24,6 +24,8 @@ Change the directory for your own design.
 
 `python3 run_iccad13.py`
 
+We did not include the EPE computing code in this repo, please use [neuralILT](https://github.com/cuhk-eda/neural-ilt) or other 3rd party tools. 
+
 ## Contact
 
 [Haoyu Yang](mailto:haoyuy@nvidia.com)
