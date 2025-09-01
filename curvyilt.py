@@ -2,7 +2,7 @@
 #NVIDIA  All Rights Reserved
 #Haoyu Yang 
 #Design Automation Research
-#Last Update: May 14 2025
+#Last Update: Aug 14 2025
 #############################
 
 import torch
@@ -16,7 +16,7 @@ import os
 import math  
 import pdb
 from kornia.morphology import opening, closing, dilation, erosion
-
+from torch.cuda.amp import autocast, GradScaler
 
 
 
@@ -402,6 +402,325 @@ def corner_retargeting_morph(image, kernel_convex=20, kernel_concave=None,output
     if output_filename:
         cv2.imwrite(output_filename, image * 255)  # Convert to 0-255 scale for PNG
     return image
+
+def corner_retargeting_morph_2(image, kernel_convex=20, kernel_concave=None,output_filename=None):
+    if kernel_concave is None:
+        kernel_concave = kernel_convex
+    images_np = image.cpu().numpy()
+    processed_images = []
+    for i in range(images_np.shape[0]):
+        single_image_np = images_np[i, 0, :, :]
+        image_open = morph_open_cv2(single_image_np, kernel_convex)
+        image_close = morph_close_cv2(single_image_np, kernel_concave)
+        processed_image = image_open + image_close - single_image_np
+        processed_images.append(processed_image)
+
+    if output_filename:
+        cv2.imwrite(output_filename, processed_images[0] * 255)
+
+    processed_images_np = np.stack(processed_images, axis=0)
+    processed_images_np = np.expand_dims(processed_images_np, axis=1)
+    return torch.from_numpy(processed_images_np).float().cuda()
+
+
+########################################################
+#################  Dev: Support for Batch Processing #####################
+########################################################
+
+class litho_batch(nn.Module):
+    def __init__(self, target_images, mask_steepness=4, resist_th =0.225, resist_steepness=50, mask_shift=0.5, pvb_coefficient=0, max_dose=1.02, min_dose=0.98, avepool_kernel=3, morph=0, scale_factor=1, pixel_size=1, max_iter=None):
+        super(litho_batch, self).__init__()
+        self.target_image = target_images.cuda()
+
+        n, _, self.mask_dim1, self.mask_dim2 = self.target_image.shape
+
+        self.mask = nn.Parameter(self.target_image)    
+        self.fo, self.defo, self.fo_scale, self.defo_scale = get_kernels()
+
+        self.kernel_focus = torch.tensor(self.fo).cuda()
+        self.kernel_focus_scale = torch.tensor(self.fo_scale).cuda()
+        self.kernel_defocus = torch.tensor(self.defo).cuda()
+        self.kernel_defocus_scale = torch.tensor(self.defo_scale).cuda()
+        self.kernel_focus = torch.repeat_interleave(self.kernel_focus.unsqueeze(0), n, 0)  # Add batch dimension
+        self.kernel_defocus = torch.repeat_interleave(self.kernel_defocus.unsqueeze(0), n, 0)  # Add batch dimension
+
+        self.kernel_num, self.kernel_dim1, self.kernel_dim2 = self.fo.shape # 24 35 35
+        self.offset = self.mask_dim1//2-self.kernel_dim1//2
+        self.max_dose = max_dose
+        self.min_dose = min_dose
+        self.resist_steepness = resist_steepness
+        self.mask_steepness = mask_steepness
+        self.resist_th = resist_th
+        self.mask_shift = mask_shift
+
+        #members of DAC'23 FDU
+        self.scale_factor = scale_factor
+        self.mask_dim1_s = self.mask_dim1//self.scale_factor
+        self.mask_dim2_s = self.mask_dim2//self.scale_factor
+        self.target_image_s = nn.functional.avg_pool2d(self.target_image, self.scale_factor)
+
+        self.mask_s      = nn.Parameter(self.target_image_s)
+
+        self.avepool = nn.AvgPool2d(kernel_size=avepool_kernel, stride=1, padding = avepool_kernel//2)
+
+
+        self.offset_s = self.mask_dim1_s//2-self.kernel_dim1//2
+
+        self.max_iter=max_iter
+        #morphlogic for mask simplification
+        self.morph = morph
+        if self.morph>0:
+
+            self.morph_kernel_opt_opening =torch.tensor(cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph,morph)).astype(np.float32)).cuda()
+            self.morph_kernel_opt_closing =torch.tensor(cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph+2,morph+2)).astype(np.float32)).cuda()
+            self.morph_kernel_opening = torch.tensor(cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (morph*scale_factor+1,morph*scale_factor+1)).astype(np.float32)).cuda()
+            self.morph_kernel_closing = torch.tensor(cv2.getStructuringElement(cv2.MORPH_ELLIPSE, ((morph-2)*self.scale_factor+1,(morph-2)*self.scale_factor+1)).astype(np.float32)).cuda()
+
+        self.iter=0
+
+
+
+    def standalone_mask_morph(self):
+        mask = self.avepool(self.mask_s)
+        mask = torch.sigmoid(self.mask_steepness*(mask-self.mask_shift))
+        mask_o = opening(mask, self.morph_kernel_opt_opening)
+        mask_c = closing(mask, self.morph_kernel_opt_closing)
+        mask = mask_o+mask_c-mask
+        return mask
+
+    def forward_test(self,use_morph=False):  
+        mask = torch.zeros_like(self.target_image).cuda()
+        cmask = self.mask.data
+        #print(mask.shape, cmask.shape)
+        mask[self.mask.data>=0.5]=1.0
+        mask[self.mask.data<0.5]=0.0
+
+        n,_,h,w = mask.shape
+        if self.morph>0 and use_morph:
+            mask_o = opening(mask, self.morph_kernel_opening, engine="convolution")
+            mask_c = closing(mask, self.morph_kernel_closing, engine="convolution")
+            mask = mask_o+mask_c-mask
+            mask = opening(mask, self.morph_kernel_opening, engine="convolution")
+            mask = closing(mask, self.morph_kernel_closing, engine="convolution")
+
+        mask_fft = torch.fft.fftshift(torch.fft.fft2(mask), dim=(-2,-1)) 
+        mask_fft = torch.repeat_interleave(mask_fft, self.kernel_num, 1) 
+
+
+        mask_fft_max = torch.fft.fftshift(torch.fft.fft2(mask*self.max_dose), dim=(-2,-1)) 
+        mask_fft_max = torch.repeat_interleave(mask_fft_max, self.kernel_num, 1) 
+
+        mask_fft_min = torch.fft.fftshift(torch.fft.fft2(mask*self.min_dose), dim=(-2,-1)) 
+        mask_fft_min = torch.repeat_interleave(mask_fft_min, self.kernel_num, 1) 
+
+
+
+        x_out= mask_fft[:, :, self.offset: self.offset+self.kernel_dim1, self.offset: self.offset+self.kernel_dim2] * self.kernel_focus
+        x_out = torch.fft.ifft2(x_out, s=(h,w))
+        x_out = x_out.real*x_out.real + x_out.imag*x_out.imag
+        x_out = x_out * self.kernel_focus_scale
+        x_out = torch.sum(x_out, axis=1, keepdims=True)
+        self.aerial = x_out
+        x_out = torch.sigmoid(self.resist_steepness*(x_out-self.resist_th))
+
+
+        x_out_max = mask_fft_max[:, :, self.offset: self.offset+self.kernel_dim1, self.offset: self.offset+self.kernel_dim2] * self.kernel_focus
+        x_out_max = torch.fft.ifft2(x_out_max, s=(h,w))
+        x_out_max = x_out_max.real*x_out_max.real + x_out_max.imag*x_out_max.imag
+        x_out_max = x_out_max * self.kernel_focus_scale
+        x_out_max = torch.sum(x_out_max, axis=1, keepdims=True)
+        x_out_max = torch.sigmoid(self.resist_steepness*(x_out_max-self.resist_th))
+
+        x_out_min = mask_fft_min[:, :, self.offset: self.offset+self.kernel_dim1, self.offset: self.offset+self.kernel_dim2] * self.kernel_defocus
+        x_out_min = torch.fft.ifft2(x_out_min, s=(h,w))
+        x_out_min = x_out_min.real*x_out_min.real + x_out_min.imag*x_out_min.imag
+        x_out_min = x_out_min * self.kernel_defocus_scale
+        x_out_min = torch.sum(x_out_min, axis=1, keepdims=True)
+        x_out_min = torch.sigmoid(self.resist_steepness*(x_out_min-self.resist_th))
+
+        x_out[x_out>=0.5]=1.0
+        x_out[x_out<0.5]=0.0
+        x_out_max[x_out_max>=0.5]=1.0
+        x_out_max[x_out_max<0.5]=0.0
+        x_out_min[x_out_min>=0.5]=1.0
+        x_out_min[x_out_min<0.5]=0.0
+
+
+        return mask, cmask, x_out, x_out_max, x_out_min
+    
+    
+    def forward(self,mask=None): 
+
+        if mask is None:
+            mask = self.avepool(self.mask_s)
+        else:
+            mask = self.avepool(mask)
+        n,_,h,w = mask.shape
+
+        mask = torch.sigmoid(self.mask_steepness*(mask-self.mask_shift))
+
+        if self.morph>0 and self.iter % 2==0 and self.iter >50:
+            mask_o = opening(mask, self.morph_kernel_opt_opening, engine="convolution")
+            mask_c = closing(mask, self.morph_kernel_opt_closing, engine="convolution")
+            mask = mask_o+mask_c-mask
+
+
+
+
+        mask_fft = torch.fft.fftshift(torch.fft.fft2(mask), dim=(-2,-1)) 
+        self.i_mask_fft = mask_fft
+        mask_fft = torch.repeat_interleave(mask_fft, self.kernel_num, 1) 
+
+        
+
+        mask_fft_max = mask_fft*self.max_dose
+
+        mask_fft_min = mask_fft*self.min_dose
+
+
+
+
+        x_out= mask_fft[:, :, self.offset_s: self.offset_s+self.kernel_dim1, self.offset_s: self.offset_s+self.kernel_dim2] * self.kernel_focus
+        x_out = torch.fft.ifft2(x_out, s=(h,w))
+        x_out = x_out.real*x_out.real + x_out.imag*x_out.imag
+        x_out = x_out * self.kernel_focus_scale
+        x_out = torch.sum(x_out, axis=1, keepdims=True)
+        x_out = torch.sigmoid(self.resist_steepness*(x_out-self.resist_th))
+
+
+        x_out_max = mask_fft_max[:, :, self.offset_s: self.offset_s+self.kernel_dim1, self.offset_s: self.offset_s+self.kernel_dim2] * self.kernel_focus
+        x_out_max = torch.fft.ifft2(x_out_max, s=(h,w))
+        x_out_max = x_out_max.real*x_out_max.real + x_out_max.imag*x_out_max.imag
+        x_out_max = x_out_max * self.kernel_focus_scale
+        x_out_max = torch.sum(x_out_max, axis=1, keepdims=True)
+        x_out_max = torch.sigmoid(self.resist_steepness*(x_out_max-self.resist_th))
+
+        x_out_min = mask_fft_min[:, :, self.offset_s: self.offset_s+self.kernel_dim1, self.offset_s: self.offset_s+self.kernel_dim2] * self.kernel_defocus
+        x_out_min = torch.fft.ifft2(x_out_min, s=(h,w))
+        x_out_min = x_out_min.real*x_out_min.real + x_out_min.imag*x_out_min.imag
+        x_out_min = x_out_min * self.kernel_defocus_scale
+        x_out_min = torch.sum(x_out_min, axis=1, keepdims=True)
+        x_out_min = torch.sigmoid(self.resist_steepness*(x_out_min-self.resist_th))
+
+
+        return mask, x_out, x_out_max, x_out_min
+
+    def forward_test_nominal(self,use_morph=False):  
+        mask = torch.zeros_like(self.target_image).cuda()
+        cmask = self.mask.data
+        #print(mask.shape, cmask.shape)
+        mask[self.mask.data>=0.5]=1.0
+        mask[self.mask.data<0.5]=0.0
+
+        n,_,h,w = mask.shape
+        if self.morph>0 and use_morph:
+            mask_o = opening(mask, self.morph_kernel_opening, engine="convolution")
+            mask_c = closing(mask, self.morph_kernel_closing, engine="convolution")
+            mask = mask_o+mask_c-mask
+            mask = opening(mask, self.morph_kernel_opening, engine="convolution")
+            mask = closing(mask, self.morph_kernel_closing, engine="convolution")
+
+        mask_fft = torch.fft.fftshift(torch.fft.fft2(mask), dim=(-2,-1)) 
+        mask_fft = torch.repeat_interleave(mask_fft, self.kernel_num, 1) 
+
+
+
+
+        x_out= mask_fft[:, :, self.offset: self.offset+self.kernel_dim1, self.offset: self.offset+self.kernel_dim2] * self.kernel_focus
+        x_out = torch.fft.ifft2(x_out, s=(h,w))
+        x_out = x_out.real*x_out.real + x_out.imag*x_out.imag
+        x_out = x_out * self.kernel_focus_scale
+        x_out = torch.sum(x_out, axis=1, keepdims=True)
+        self.aerial = x_out
+        x_out = torch.sigmoid(self.resist_steepness*(x_out-self.resist_th))
+
+
+
+        x_out[x_out>=0.5]=1.0
+        x_out[x_out<0.5]=0.0
+
+
+
+        return x_out
+ 
+
+class solver_batch():
+    def __init__(self, target_images, avepool_kernel=5,morph=0,scale_factor=1,pixel_size=1,all_tech=0,device="cuda:0"):
+        
+        self.target = target_images.cuda()
+        self.litho = litho_batch(target_images=target_images, avepool_kernel=avepool_kernel, morph=morph,scale_factor=scale_factor,pixel_size=pixel_size).to(device)
+        self.optimizer = torch.optim.SGD(self.litho.parameters(), lr=1)
+        #self.optimizer = Prodigy(self.nvilt.parameters(), lr=1, weight_decay=0)
+        self.iteration = 0
+
+        n, _, self.mask_dim1, self.mask_dim2 = self.target.shape
+
+        self.mask_dim1_s = self.mask_dim1//self.litho.scale_factor
+        self.mask_dim2_s = self.mask_dim2//self.litho.scale_factor
+        self.target_s = nn.functional.avg_pool2d(self.target, self.litho.scale_factor)
+        self.lowpass = 2
+        self.lowpass_mask = torch.ones(n,1,self.mask_dim1_s, self.mask_dim2_s).cuda()
+        self.lowpass_offset = self.mask_dim1_s//2-self.lowpass//2
+        self.lowpass_mask[:,:,self.lowpass_offset:self.lowpass_offset+self.lowpass, self.lowpass_offset:self.lowpass_offset+self.lowpass]=0
+
+        #self.gmask = torch.ones_like(self.target)
+        #self.target_smooth, self.gmask = self.smooth_target()
+        self.loss =0
+        self.loss_l2=0
+        self.loss_pvb=0
+        self.loss_pvb_i =0
+        self.loss_pvb_o =0
+        self.loss_pvb = 0
+        self.loss_lowpass_reg=0
+
+        self.forward_type=0  #0: mask<->fft<->image  #1: mask->fft<->image (_deprecated)
+
+        self.lowpass_reg_lambda = 0
+
+        # --- AMP Scaler ---
+        self.scaler = GradScaler()
+
+
+
+    def backward(self):
+        self.loss.backward()
+
+    def forward(self):
+
+        self.mask = self.litho.mask_s.data
+        
+        _, self.nominal, self.outer, self.inner = self.litho.forward()
+        self.i_mask_fft = self.litho.i_mask_fft
+        #if self.iteration%10==0:
+        #    self.all_image = torch.cat((self.mask, self.nominal, self.outer, self.inner), dim=3).cpu().detach().numpy()[0,0,:,:]*255
+        #    cv2.imwrite(self.image_path+".iter%g.png"%self.iteration, self.all_image)
+        self.iteration = self.iteration + 1
+        self.litho.iter = self.iteration
+
+    def optimize(self):
+        self.optimizer.zero_grad()
+
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            self.forward()
+            self.loss_l2 = l2_loss(self.outer, self.target_s)
+            self.loss_pvb = l2_loss(self.inner, self.outer) 
+            self.loss_lowpass_reg = torch.norm(torch.abs(self.i_mask_fft*self.lowpass_mask))
+            #self.loss_pvb_o = l2_loss(self.outer, self.target_s)
+            #self.real_pvb = l2_loss(self.inner, self.outer) 
+            self.loss = self.loss_l2 + self.loss_pvb #+ self.lowpass_reg_lambda*self.loss_lowpass_reg
+        
+        # Scales loss. Calls backward() on scaled loss to create scaled gradients.
+        self.scaler.scale(self.loss).backward()
+
+        # scaler.step() first unscales the gradients of the optimizer's assigned params.
+        # If these gradients do not contain infs or NaNs, optimizer.step() is then called.
+        self.scaler.step(self.optimizer)
+
+        # Updates the scale for next iteration.
+        self.scaler.update()
+
+
+
 
 if __name__=="__main__":
     path="./benchmarks/M1_test2/M1_test2.png"

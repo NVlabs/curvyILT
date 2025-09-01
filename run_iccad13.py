@@ -49,7 +49,7 @@ if __name__=="__main__":
 
             solver.litho.mask.data = nn.functional.interpolate(input=solver.litho.avepool(solver.litho.mask_s).data, scale_factor=solver.litho.scale_factor, mode = 'bicubic', align_corners=False, antialias=True)
 
-            mask, cmask, x_out, x_out_max, x_out_min = solver.litho.forward_test(use_morph=True)
+            x_out, x_out_max, x_out_min = solver.litho.forward_test(use_morph=True)
             
             results = curvyilt.evaluation(mask, solver.target, x_out, x_out_min, x_out_max) 
             l2 =results.get_l2()
