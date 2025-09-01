@@ -7,6 +7,10 @@ The source code of
 *Proceedings of the 2025 International Symposium on Physical Design*, pp. 42–50, 2025.
 
 
+## Update
+
+08/25/2025: We enabled batch optimization, in `run_iccad13_batch.py`, 10 ILT runs in parallel and finish in 4s on RTX 6000 ADA. Morph is disabled in forward_test because it cost lots of memory.
+
 ## Prepare
 
 Install Package Dependencies
@@ -29,6 +33,8 @@ We did not include the EPE computing code in this repo, please use [neuralILT](h
 ## Contact
 
 [Haoyu Yang](mailto:haoyuy@nvidia.com)
+
+
 
 
 
