@@ -11,6 +11,8 @@ The source code of
 
 08/25/2025: We enabled batch optimization, in `run_iccad13_batch.py`, 10 ILT runs in parallel and finish in 4s on RTX 6000 ADA. Morph is disabled in forward_test because it cost lots of memory.
 
+10/03/2025: Full chip ILT is enabled, checkout `fullchip` branch for details.
+
 ## Prepare
 
 Install Package Dependencies
