@@ -27,10 +27,10 @@ Install OpenCV seperately
 
 ## Usage
 
-This is a running example on ICCAD13 benchmark images.
+This is a running example on NVDLA benchmark images.
 Change the directory for your own design.
 
-`python3 run_iccad13.py`
+`python3 run_fullchip.py --image ./benchmarks/nvdla/v1.png`
 
 We did not include the EPE computing code in this repo, please use [neuralILT](https://github.com/cuhk-eda/neural-ilt) or other 3rd party tools. 
 
